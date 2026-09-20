@@ -15,12 +15,14 @@ extra bookkeeping, and files added since the last run are picked up too.
 """
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -107,6 +109,69 @@ def alphabetize_skip_log(skip_log_path: Path) -> None:
     skip_log_path.write_text("".join(entry + "\n" for entry in entries), encoding="utf-8")
 
 
+def _human_size(num_bytes: float) -> str:
+    size = float(num_bytes)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if abs(size) < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TiB"
+
+
+def _run_rclone_quiet(command: list[str]) -> int:
+    """Run rclone with JSON logging and print one summary line per 1% of progress.
+
+    Meant for a job whose output is being redirected to a log file: rclone's
+    own --progress bar repaints a line in place with carriage returns, which
+    turns into unreadable noise in a log file. This reads rclone's periodic
+    JSON stats off stderr instead and only echoes a line when the percentage
+    complete has actually moved, so a log file gets a clean, appendable trail.
+    """
+    last_percent = -1
+    process = subprocess.Popen(command, stderr=subprocess.PIPE, text=True, bufsize=1)
+    try:
+        for line in process.stderr:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                print(line, flush=True)
+                continue
+
+            stats = payload.get("stats")
+            if stats is None:
+                msg = payload.get("msg", "").strip()
+                if msg:
+                    print(f"[rclone {payload.get('level', 'info').upper()}] {msg}", flush=True)
+                continue
+
+            total_bytes = stats.get("totalBytes") or 0
+            done_bytes = stats.get("bytes") or 0
+            percent = int(done_bytes * 100 / total_bytes) if total_bytes else 0
+            if percent == last_percent:
+                continue
+            last_percent = percent
+
+            transfers_done = stats.get("transfers") or 0
+            transfers_total = stats.get("totalTransfers") or 0
+            remaining = max(transfers_total - transfers_done, 0)
+            eta = stats.get("eta")
+            eta_text = f"{eta:.0f}s" if isinstance(eta, (int, float)) else "-"
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(
+                f"[{timestamp}] {percent}% - {transfers_done:,}/{transfers_total:,} files "
+                f"({remaining:,} remaining) - {_human_size(done_bytes)}/{_human_size(total_bytes)} "
+                f"transferred - {_human_size(stats.get('speed') or 0)}/s - ETA {eta_text}",
+                flush=True,
+            )
+    finally:
+        process.wait()
+
+    return process.returncode
+
+
 def run_rclone(
     root: Path,
     destination: str,
@@ -116,14 +181,13 @@ def run_rclone(
     checksum: bool,
     dry_run: bool,
     extra_args: list[str],
+    quiet: bool = False,
 ) -> int:
     command = [
         "rclone", "copy", str(root), destination,
         "--files-from", str(files_from),
         "--transfers", str(transfers),
         "--checkers", str(checkers),
-        "--progress",
-        "--stats", "5s",
         "--retries", "5",
         "--low-level-retries", "10",
     ]
@@ -131,8 +195,15 @@ def run_rclone(
         command.append("--checksum")
     if dry_run:
         command.append("--dry-run")
-    command.extend(extra_args)
 
+    if quiet:
+        command += ["--use-json-log", "--stats-log-level", "NOTICE", "--stats", "5s"]
+        command.extend(extra_args)
+        print("Running:", " ".join(command))
+        return _run_rclone_quiet(command)
+
+    command += ["--progress", "--stats", "5s"]
+    command.extend(extra_args)
     print("Running:", " ".join(command))
     return subprocess.call(command)
 
@@ -145,6 +216,11 @@ def main() -> None:
     parser.add_argument("--checkers", type=int, default=16, help="Concurrent existence checks against the destination (default: 16)")
     parser.add_argument("--checksum", action="store_true", help="Compare files by checksum instead of size+modtime (slower, safer resume)")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be transferred without uploading anything")
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Print one summary line per 1%% of progress instead of a live-updating bar (for logging to a file)",
+    )
     parser.add_argument(
         "--skip-log",
         type=Path,
@@ -181,6 +257,7 @@ def main() -> None:
             args.checksum,
             args.dry_run,
             extra_args,
+            args.quiet,
         )
     finally:
         files_from.unlink(missing_ok=True)

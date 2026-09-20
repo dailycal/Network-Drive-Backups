@@ -89,7 +89,7 @@ python -m unittest tests.test_check_file tests.test_backup -v
 python3 -m unittest tests.test_check_file tests.test_backup -v
 ```
 
-All 25 tests should report `ok`.
+All 29 tests should report `ok`.
 
 ## 4. Run the backup
 
@@ -117,6 +117,11 @@ The script prints how many files it found and where the skipped ones were logged
 - `--checkers N` — number of concurrent existence checks against the destination (default 16).
 - `--checksum` — compare files by content hash instead of size + modified time before deciding to skip them. Slower on a 4 TB tree, but the strongest guarantee that "already backed up" really means identical.
 - `--dry-run` — print what would be transferred without uploading anything.
+- `--quiet` — for when output is being redirected to a log file instead of watched live (e.g. `python scripts/backup.py Q:\ gdrive:Q-Finance --quiet > backup.log 2>&1`). Swaps rclone's live-redrawing progress bar (unreadable once it's full of `\r` characters in a log file) for one clean line per 1% of progress, each with a timestamp, files transferred/remaining, and bytes transferred:
+  ```
+  [2026-09-20 16:55:49] 41% - 10,612/25,852 files (15,240 remaining) - 10.1 GiB/24.7 GiB transferred - 6.6 MiB/s - ETA 34m12s
+  ```
+  Real errors and warnings from rclone are still always printed in full, regardless of the 1% throttling.
 - `--skip-log path.txt` — where excluded paths are recorded, one per line (default: `skipped_files.txt` in the current directory).
 
 ### The skip log

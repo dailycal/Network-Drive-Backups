@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Tests for scripts/backup.py's filtering, skip-log handling, command-building, and CLI wiring."""
 
+import io
+import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -184,6 +187,99 @@ class RunRcloneCommandTests(unittest.TestCase):
             )
 
         self.assertEqual(exit_code, 7)
+
+    def test_quiet_mode_swaps_progress_for_json_logging_and_does_not_use_subprocess_call(self):
+        with patch("scripts.backup.subprocess.call") as mock_call, \
+                patch("scripts.backup._run_rclone_quiet", return_value=0) as mock_quiet:
+            exit_code = backup.run_rclone(
+                Path("/src"), "gdrive:dest", Path("/tmp/list.txt"),
+                transfers=8, checkers=16, checksum=False, dry_run=False, extra_args=[],
+                quiet=True,
+            )
+
+        self.assertEqual(exit_code, 0)
+        mock_call.assert_not_called()
+        command = mock_quiet.call_args[0][0]
+        self.assertIn("--use-json-log", command)
+        self.assertIn("--stats-log-level", command)
+        self.assertNotIn("--progress", command)
+
+
+class FakeRcloneProcess:
+    """Stands in for a subprocess.Popen handle streaming rclone's JSON log lines."""
+
+    def __init__(self, lines: list[str], returncode: int = 0):
+        self.stderr = iter(lines)
+        self.returncode = returncode
+
+    def wait(self) -> int:
+        return self.returncode
+
+
+def _stats_line(bytes_done: int, total_bytes: int, transfers: int, total_transfers: int, eta=None) -> str:
+    return json.dumps({
+        "level": "notice",
+        "msg": "stats",
+        "stats": {
+            "bytes": bytes_done,
+            "totalBytes": total_bytes,
+            "transfers": transfers,
+            "totalTransfers": total_transfers,
+            "speed": 1234.0,
+            "eta": eta,
+        },
+    })
+
+
+class RunRcloneQuietModeTests(unittest.TestCase):
+    def test_only_prints_when_the_percent_actually_changes(self):
+        lines = [
+            _stats_line(0, 1000, 0, 10, eta=20),      # 0% -> prints (first tick)
+            _stats_line(5, 1000, 0, 10, eta=19),      # still 0% -> suppressed
+            _stats_line(120, 1000, 1, 10, eta=15),    # 12% -> prints
+            _stats_line(125, 1000, 1, 10, eta=15),    # still 12% -> suppressed
+            _stats_line(999, 1000, 9, 10, eta=1),     # 99% -> prints
+        ]
+        process = FakeRcloneProcess(lines, returncode=0)
+
+        buffer = io.StringIO()
+        with patch("scripts.backup.subprocess.Popen", return_value=process):
+            with redirect_stdout(buffer):
+                exit_code = backup._run_rclone_quiet(["rclone", "copy"])
+
+        self.assertEqual(exit_code, 0)
+        output_lines = [line for line in buffer.getvalue().splitlines() if line]
+        self.assertEqual(len(output_lines), 3)
+        self.assertIn("0%", output_lines[0])
+        self.assertIn("12%", output_lines[1])
+        self.assertIn("99%", output_lines[2])
+        # Each line carries a timestamp, files transferred/remaining, and size transferred.
+        self.assertRegex(output_lines[1], r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]")
+        self.assertIn("1/10 files", output_lines[1])
+        self.assertIn("9 remaining", output_lines[1])
+
+    def test_non_stats_log_messages_are_always_surfaced(self):
+        lines = [
+            json.dumps({"level": "error", "msg": "Failed to copy: permission denied"}),
+            _stats_line(500, 1000, 5, 10, eta=5),
+        ]
+        process = FakeRcloneProcess(lines, returncode=0)
+
+        buffer = io.StringIO()
+        with patch("scripts.backup.subprocess.Popen", return_value=process):
+            with redirect_stdout(buffer):
+                backup._run_rclone_quiet(["rclone", "copy"])
+
+        self.assertIn("Failed to copy: permission denied", buffer.getvalue())
+
+    def test_returns_the_process_return_code(self):
+        process = FakeRcloneProcess([_stats_line(1000, 1000, 10, 10)], returncode=9)
+
+        with patch("scripts.backup.subprocess.Popen", return_value=process):
+            with redirect_stdout(io.StringIO()):
+                exit_code = backup._run_rclone_quiet(["rclone", "copy"])
+
+        self.assertEqual(exit_code, 9)
 
 
 class MainGuardClauseTests(unittest.TestCase):
