@@ -1,8 +1,10 @@
 # scripts/
 
 - `check_file.py` — exports `should_back_up(path)`, which returns `False` for junk/cache/lock files and for copies of installed applications found on the drives (Firefox, QuickBooks Premier, RAPID), and `True` for everything else.
-- `backup.py` — walks a directory, filters it through `should_back_up`, and hands the result to `rclone` for a resumable, concurrent upload.
-- Tests for `check_file.py` live in `../tests/test_check_file.py`.
+- `backup.py` — lists a source through `rclone lsjson`, filters it through `should_back_up`, and hands the result to `rclone copy` for a resumable, concurrent upload. Both listing and copying go through rclone, so the source can be a local path, a mapped/mounted drive, *or* a native rclone remote (e.g. an SMB share configured once with `rclone config`) — the script never touches the filesystem or a network share directly.
+- Tests live in `../tests/test_check_file.py` and `../tests/test_backup.py`.
+
+This file covers Windows and Mac setup. For a headless Linux server — including authenticating Google Drive without a browser and running the job unattended in `tmux` — see [`RUN_INSTRUCTIONS.md`](./RUN_INSTRUCTIONS.md) instead.
 
 ## 1. Install prerequisites
 
@@ -67,6 +69,21 @@ Choose `n` for a new remote, name it `gdrive`, pick **Google Drive** from the st
 rclone lsd gdrive:
 ```
 
+**Optional but recommended** — one-time setup of the SMB share itself as a remote too, so the script can reach it directly without you first mapping a drive letter or connecting to it in Finder:
+```
+rclone config
+```
+Choose `n`, name it something like `finance-smb`, pick **smb** from the storage list, then fill in:
+- `host` — the server's address (e.g. `192.168.234.30`)
+- `user` / `pass` — credentials for the share (`rclone config` will offer to obscure the password for you)
+- `domain` — leave blank unless your server requires one
+
+Test it worked with:
+```
+rclone lsd finance-smb:
+```
+That should list the shares on the server. From then on, `finance-smb:Q` (share name `Q`) is a valid source for the backup script — see the examples below.
+
 ## 2. Get the repo
 
 ```
@@ -89,22 +106,29 @@ python -m unittest tests.test_check_file tests.test_backup -v
 python3 -m unittest tests.test_check_file tests.test_backup -v
 ```
 
-All 29 tests should report `ok`.
+All 33 tests should report `ok`.
 
 ## 4. Run the backup
 
 ```
-python scripts/backup.py <root> <destination>
+python scripts/backup.py <source> <destination>
 ```
-- `<root>` — the local path to the drive/folder you're backing up.
-- `<destination>` — an `rclone` destination, in `remote:path` form.
+- `<source>` — what to back up. Any of: a local path, a mapped/mounted network drive, or a `remote:path` you set up with `rclone config` (e.g. the `finance-smb:Q` SMB remote from step 1).
+- `<destination>` — an `rclone` destination, in `remote:path` form (e.g. `gdrive:Backups/Q-Drive`).
 
-**Windows example**, backing up the whole Q: drive:
+**Recommended — a native SMB remote**, no drive-mapping or Finder-connecting needed, and it works the same from any machine that has this repo and rclone configured:
+```
+python scripts/backup.py finance-smb:Q gdrive:Backups/Q-Drive
+```
+
+**Alternative — a local path or a drive you've already mapped/mounted yourself:**
+
+Windows:
 ```
 python scripts\backup.py Q:\ gdrive:Backups/Q-Drive
 ```
 
-**Mac example**, backing up the same Q drive (once the network share is connected, it typically shows up under `/Volumes`):
+Mac (once the share is connected, it typically shows up under `/Volumes`):
 ```
 python3 scripts/backup.py /Volumes/Q gdrive:Backups/Q-Drive
 ```
@@ -122,6 +146,8 @@ The script prints how many files it found and where the skipped ones were logged
   [2026-09-20 16:55:49] 41% - 10,612/25,852 files (15,240 remaining) - 10.1 GiB/24.7 GiB transferred - 6.6 MiB/s - ETA 34m12s
   ```
   Real errors and warnings from rclone are still always printed in full, regardless of the 1% throttling.
+
+  The file/byte totals in that line come from the script's own scan, not from rclone's internal counters. rclone only learns a job's true total gradually, as its checkers work through the file list — early in a run its own totals are a small, still-growing partial count (e.g. it might briefly report "76 files, 16.5 GiB" when the real job is 25,852 files and 24.7 GiB), which would be a misleading thing to leave sitting in a log nobody's watching live. The script already knows the real numbers from its own scan, so it uses those instead.
 - `--skip-log path.txt` — where excluded paths are recorded, one per line (default: `skipped_files.txt` in the current directory).
 
 ### The skip log
